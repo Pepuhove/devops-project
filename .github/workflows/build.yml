@@ -1,0 +1,106 @@
+name: cicd
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  nodejs:
+    name: Node.js Install & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Tests
+        run: npm test
+
+  sonar:
+    name: SonarQube Code Analysis
+    runs-on: ubuntu-latest
+    needs: nodejs
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Run SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: sonar
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push docker image to Amazon ECR
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ secrets.REPOSITORY }}
+          IMAGE_TAG: ${{ secrets.IMAGE_TAG }}
+        run: |
+          docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
+          docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
+
+  trivy:
+    name: Run Trivy Scan on ECR Image
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        run: |
+          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+      - name: Pull ECR Image
+        run: |
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/${{ secrets.REPOSITORY }}:${{ secrets.IMAGE_TAG }}
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget curl gnupg lsb-release
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo tee /etc/apt/keyrings/trivy.asc
+          echo "deb [signed-by=/etc/apt/keyrings/trivy.asc] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -y
+          sudo apt-get install -y trivy
+
+      - name: Run Trivy Scan on Image
+        run: |
+          trivy image ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/${{ secrets.REPOSITORY }}:${{ secrets.IMAGE_TAG }} --format json -o trivy-image-report.json
+
+      - name: Upload Trivy Report as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image-report.json
